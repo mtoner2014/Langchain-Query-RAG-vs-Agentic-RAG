@@ -8,6 +8,7 @@ import streamlit as st
 import time
 from rag_medlineplus import MedlinePlusRAG
 from agentic_rag_medlineplus import AgenticMedlinePlusRAG
+from image_processor import MedicalImageAnalyzer, validate_upload
 
 # ── Crisis / Emergency Guardrails ────────────────────────────────────────────
 
@@ -194,6 +195,17 @@ section[data-testid="stSidebar"] .stRadio > label {
     color: var(--med-primary);
 }
 
+/* ── Image upload area ── */
+[data-testid="stFileUploader"] {
+    border: 2px dashed #B0C4CE;
+    border-radius: 12px;
+    padding: 0.5rem;
+    margin-bottom: 0.5rem;
+}
+[data-testid="stFileUploader"]:hover {
+    border-color: var(--med-accent);
+}
+
 /* ── Disclaimer card ── */
 .med-disclaimer {
     background: linear-gradient(135deg, #FFF7ED 0%, #FEF3C7 100%);
@@ -347,6 +359,15 @@ if "query_count" not in st.session_state:
     st.session_state.query_count = 0
 if "pending_query" not in st.session_state:
     st.session_state.pending_query = None
+if "image_analyzer" not in st.session_state:
+    st.session_state.image_analyzer = None
+
+
+def get_image_analyzer():
+    """Lazily initialise and return the image analyzer."""
+    if st.session_state.image_analyzer is None:
+        st.session_state.image_analyzer = MedicalImageAnalyzer()
+    return st.session_state.image_analyzer
 
 
 def get_rag_instance():
@@ -456,6 +477,22 @@ with st.sidebar:
         st.rerun()
 
     st.markdown("---")
+
+    # Image upload info
+    st.markdown("""
+    <div class="info-card">
+        <h4 style="margin:0 0 0.4rem 0; font-size:0.9rem; color:#0C6E87;">
+            📷 Image Analysis
+        </h4>
+        <p style="margin:0; font-size:0.78rem; color:#5A6F80;">
+            Upload lab reports, prescription labels, or symptom photos.
+            The AI will extract medical information and search MedlinePlus
+            for relevant context.
+        </p>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("---")
     # Disclaimer
     st.markdown("""
     <div class="med-disclaimer">
@@ -513,61 +550,161 @@ for msg in st.session_state.messages:
     with st.chat_message(msg["role"], avatar="🧑‍💻" if msg["role"] == "user" else "🩺"):
         st.markdown(msg["content"])
 
+# Image upload
+uploaded_file = st.file_uploader(
+    "Upload a medical image (lab report, prescription, symptom photo)",
+    type=["png", "jpg", "jpeg", "webp", "gif"],
+    key="image_upload",
+    help="Upload an image of a lab report, prescription label, or symptom photo for analysis.",
+)
+
+upload_error = None
+if uploaded_file is not None:
+    upload_error = validate_upload(uploaded_file.name, uploaded_file.size)
+    if upload_error:
+        st.error(upload_error)
+
+has_image = uploaded_file is not None and upload_error is None
+
 # Chat input
-prompt = st.chat_input("Ask a health question — e.g. What are symptoms of asthma?")
+prompt = st.chat_input("Ask a health question — or upload an image above")
 
 # Handle suggestion button clicks
 if st.session_state.pending_query:
     prompt = st.session_state.pending_query
     st.session_state.pending_query = None
 
-if prompt:
-    # Display user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user", avatar="🧑‍💻"):
-        st.markdown(prompt)
+if prompt or has_image:
+    # Build display message
+    if has_image and prompt:
+        user_display = f"[Image uploaded] {prompt}"
+    elif has_image:
+        user_display = "[Uploaded medical image for analysis]"
+    else:
+        user_display = prompt
 
-    # Crisis / emergency guardrail
-    crisis_type = detect_crisis(prompt)
-    if crisis_type == "suicide":
-        st.markdown("""
-        <div class="crisis-banner crisis-suicide">
-            <strong>⚠️ Crisis Resources</strong>
-            If you or someone you know is in crisis, please reach out immediately.<br>
-            📞 <strong>988 Suicide &amp; Crisis Lifeline</strong> — call or text <strong>988</strong><br>
-            📞 <strong>Crisis Services Canada</strong> — <strong>1-833-456-4566</strong>
-        </div>
-        """, unsafe_allow_html=True)
-    elif crisis_type == "emergency":
-        emergency_num = EMERGENCY_NUMBERS.get(
-            st.session_state.get("user_country", "Canada"), "911"
-        )
-        st.markdown(f"""
-        <div class="crisis-banner crisis-emergency">
-            <strong>🚨 Medical Emergency</strong>
-            If this is a medical emergency, call <strong>{emergency_num}</strong> immediately.
-        </div>
-        """, unsafe_allow_html=True)
+    # Display user message
+    st.session_state.messages.append({"role": "user", "content": user_display})
+    with st.chat_message("user", avatar="🧑‍💻"):
+        st.markdown(user_display)
+        if has_image:
+            st.image(uploaded_file, caption="Uploaded image", width=300)
+
+    # Crisis / emergency guardrail (on text input)
+    if prompt:
+        crisis_type = detect_crisis(prompt)
+        if crisis_type == "suicide":
+            st.markdown("""
+            <div class="crisis-banner crisis-suicide">
+                <strong>⚠️ Crisis Resources</strong>
+                If you or someone you know is in crisis, please reach out immediately.<br>
+                📞 <strong>988 Suicide &amp; Crisis Lifeline</strong> — call or text <strong>988</strong><br>
+                📞 <strong>Crisis Services Canada</strong> — <strong>1-833-456-4566</strong>
+            </div>
+            """, unsafe_allow_html=True)
+        elif crisis_type == "emergency":
+            emergency_num = EMERGENCY_NUMBERS.get(
+                st.session_state.get("user_country", "Canada"), "911"
+            )
+            st.markdown(f"""
+            <div class="crisis-banner crisis-emergency">
+                <strong>🚨 Medical Emergency</strong>
+                If this is a medical emergency, call <strong>{emergency_num}</strong> immediately.
+            </div>
+            """, unsafe_allow_html=True)
 
     # Generate response
     with st.chat_message("assistant", avatar="🩺"):
-        with st.spinner(
-            "Agent is reasoning and searching MedlinePlus..."
-            if is_agentic
-            else "Searching MedlinePlus and generating response..."
-        ):
-            try:
-                rag = get_rag_instance()
-                start = time.time()
-                response = rag.query(prompt)
-                elapsed = time.time() - start
+        try:
+            rag = get_rag_instance()
 
-                st.markdown(response)
-                st.caption(f"Response generated in {elapsed:.1f}s via **{st.session_state.rag_mode}**")
+            if has_image:
+                # Step 1: Analyze the uploaded image
+                with st.spinner("Analyzing uploaded image..."):
+                    analyzer = get_image_analyzer()
+                    image_bytes = uploaded_file.getvalue()
+                    mime_type = uploaded_file.type or "image/jpeg"
+                    image_result = analyzer.analyze_image(
+                        image_bytes, mime_type, user_text=prompt or ""
+                    )
 
-                st.session_state.messages.append({"role": "assistant", "content": response})
+                st.markdown("**Image Analysis:**")
+                st.info(image_result["summary"])
+
+                if image_result["image_type"] == "other":
+                    st.warning(
+                        "This image does not appear to contain recognizable "
+                        "medical content. Results may be limited."
+                    )
+
+                st.markdown(
+                    '<div class="med-disclaimer">'
+                    "<strong>Image Analysis Disclaimer:</strong> "
+                    "AI image analysis is not a substitute for professional "
+                    "medical interpretation. Lab results, prescriptions, and "
+                    "symptoms should always be reviewed by a qualified "
+                    "healthcare provider.</div>",
+                    unsafe_allow_html=True,
+                )
+
+                # Step 2: Use extracted query for MedlinePlus retrieval
+                search_query = image_result["search_query"]
+                if search_query:
+                    with st.spinner(
+                        "Agent is reasoning and searching MedlinePlus..."
+                        if is_agentic
+                        else "Searching MedlinePlus for related information..."
+                    ):
+                        start = time.time()
+                        response = rag.query(search_query)
+                        elapsed = time.time() - start
+
+                    st.markdown("**Related Health Information from MedlinePlus:**")
+                    st.markdown(response)
+                    st.caption(
+                        f"Response generated in {elapsed:.1f}s via "
+                        f"**{st.session_state.rag_mode}**"
+                    )
+                else:
+                    response = "Could not extract a search query from the image."
+                    st.warning(response)
+                    elapsed = 0
+
+                full_response = (
+                    f"**Image Analysis:** {image_result['summary']}\n\n"
+                    f"**Extracted Terms:** {', '.join(image_result['medical_terms'])}\n\n"
+                    f"**Related Health Information:**\n{response}"
+                )
+                st.session_state.messages.append(
+                    {"role": "assistant", "content": full_response}
+                )
                 st.session_state.query_count += 1
-            except Exception as e:
-                error_msg = f"An error occurred: {str(e)}"
-                st.error(error_msg)
-                st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+            else:
+                # Text-only: existing behavior
+                with st.spinner(
+                    "Agent is reasoning and searching MedlinePlus..."
+                    if is_agentic
+                    else "Searching MedlinePlus and generating response..."
+                ):
+                    start = time.time()
+                    response = rag.query(prompt)
+                    elapsed = time.time() - start
+
+                    st.markdown(response)
+                    st.caption(
+                        f"Response generated in {elapsed:.1f}s via "
+                        f"**{st.session_state.rag_mode}**"
+                    )
+
+                    st.session_state.messages.append(
+                        {"role": "assistant", "content": response}
+                    )
+                    st.session_state.query_count += 1
+
+        except Exception as e:
+            error_msg = f"An error occurred: {str(e)}"
+            st.error(error_msg)
+            st.session_state.messages.append(
+                {"role": "assistant", "content": error_msg}
+            )

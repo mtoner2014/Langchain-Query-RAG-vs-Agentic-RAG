@@ -4,7 +4,9 @@ An agent that can reason about healthcare queries and use tools to retrieve info
 """
 
 import os
+import re
 import requests
+from urllib.parse import urlparse, parse_qs, unquote
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Annotated
 from dotenv import load_dotenv
@@ -30,13 +32,44 @@ class MedlinePlusTools:
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Educational RAG System)'
         })
-        self.embeddings = OpenAIEmbeddings()
+        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=400,  # Small chunks for token efficiency
             chunk_overlap=30
         )
         # Cache to avoid repeated fetches
         self._cache = {}
+
+    def _search_medlineplus(self, query: str) -> List[str]:
+        """Search MedlinePlus and return relevant health topic page URLs."""
+        urls = []
+        try:
+            search_url = "https://vsearch.nlm.nih.gov/vivisimo/cgi-bin/query-meta"
+            params = {
+                'v:project': 'medlineplus',
+                'v:sources': 'medlineplus-bundle',
+                'query': query,
+            }
+            response = self.session.get(search_url, params=params, timeout=10)
+            if response.status_code == 200:
+                soup = BeautifulSoup(response.text, 'html.parser')
+                for link in soup.find_all('a', href=True):
+                    href = link['href']
+                    # Search results use redirect URLs with the real URL in a 'url' param
+                    if 'v:frame=redirect' in href or 'v%3aframe=redirect' in href:
+                        parsed = urlparse(href)
+                        qs = parse_qs(parsed.query)
+                        target = qs.get('url', [None])[0]
+                        if target:
+                            target = unquote(target)
+                            if re.match(r'https://medlineplus\.gov/[a-zA-Z]+\.html$', target):
+                                if target not in urls:
+                                    urls.append(target)
+                                    if len(urls) >= 3:
+                                        break
+        except Exception:
+            pass
+        return urls
 
     def _scrape_topic_page(self, topic: str) -> Optional[Dict]:
         """Scrape a health topic page."""
@@ -45,11 +78,22 @@ class MedlinePlusTools:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        urls_to_try = [
-            f"{self.BASE_URL}/{topic.lower().replace(' ', '')}.html",
-            f"{self.BASE_URL}/healthtopics/{topic.lower().replace(' ', '')}.html",
-            f"{self.BASE_URL}/druginfo/meds/a{topic.lower()[:3]}.html",
-        ]
+        # Build candidate URLs: direct slug guess + search results
+        slug = topic.lower().replace(' ', '').replace('-', '')
+        urls_to_try = [f"{self.BASE_URL}/{slug}.html"]
+
+        # For multi-word topics, also try individual words as slugs
+        words = topic.lower().split()
+        if len(words) > 1:
+            for word in words:
+                word = word.strip()
+                if len(word) > 2:
+                    candidate = f"{self.BASE_URL}/{word}.html"
+                    if candidate not in urls_to_try:
+                        urls_to_try.append(candidate)
+
+        # Add URLs discovered via MedlinePlus search
+        urls_to_try.extend(self._search_medlineplus(topic))
 
         for url in urls_to_try:
             try:
@@ -65,37 +109,31 @@ class MedlinePlusTools:
                 if title_tag:
                     title = title_tag.get_text(strip=True)
 
-                # Extract content efficiently
+                # Extract content from the topic-summary div
                 content_parts = []
 
-                # Look for summary first (most important!)
-                summary = soup.find(['div', 'section'], {'id': 'topic-summary'})
-                if summary:
-                    summary_text = summary.get_text(strip=True)[:800]
-                    content_parts.append(f"Summary: {summary_text}")
+                topic_summary = soup.find('div', {'id': 'topic-summary'})
+                if topic_summary:
+                    for child in topic_summary.children:
+                        if not hasattr(child, 'name') or not child.name:
+                            continue
+                        if child.name == 'h3':
+                            content_parts.append(f"\n{child.get_text(strip=True)}")
+                        elif child.name in ['p', 'ul', 'ol']:
+                            text = child.get_text(strip=True)
+                            if text and len(text) > 20:
+                                content_parts.append(text[:400])
 
-                # Get key sections but limit content
-                main = soup.find('article') or soup.find('main') or soup.find('div', {'role': 'main'})
-                if main:
-                    headers = main.find_all(['h2', 'h3'], limit=5)
-                    for header in headers:
-                        header_text = header.get_text(strip=True)
-                        # Get next sibling paragraph
-                        next_p = header.find_next('p')
-                        if next_p:
-                            p_text = next_p.get_text(strip=True)[:300]
-                            content_parts.append(f"{header_text}: {p_text}")
-
-                # Fallback
+                # Fallback: grab paragraphs directly
                 if not content_parts:
-                    paragraphs = soup.find_all('p', limit=5)
+                    paragraphs = soup.find_all('p', limit=10)
                     content_parts = [p.get_text(strip=True)[:300] for p in paragraphs if len(p.get_text()) > 30]
 
                 if content_parts:
                     result = {
                         'title': title,
                         'url': url,
-                        'content': '\n\n'.join(content_parts[:5])  # Max 5 sections
+                        'content': '\n\n'.join(content_parts[:10])
                     }
                     self._cache[cache_key] = result
                     return result
@@ -106,14 +144,18 @@ class MedlinePlusTools:
         return None
 
     def _filter_relevant_content(self, content: str, query: str, max_tokens: int = 500) -> str:
-        """Filter content to only include query-relevant parts (TOKEN EFFICIENT!)."""
+        """Filter content to only include query-relevant parts."""
         if not content:
             return ""
+
+        # If content is already short enough, return it all
+        if len(content) <= max_tokens * 4:
+            return content
 
         # Split into chunks
         chunks = self.text_splitter.split_text(content)
         if not chunks:
-            return content[:max_tokens * 4]  # Rough char estimate
+            return content[:max_tokens * 4]
 
         # Create documents
         docs = [Document(page_content=chunk) for chunk in chunks]
@@ -121,12 +163,12 @@ class MedlinePlusTools:
         # Use embeddings to find most relevant chunks
         try:
             temp_store = FAISS.from_documents(docs, self.embeddings)
-            results = temp_store.similarity_search_with_score(query, k=2)
+            results = temp_store.similarity_search_with_score(query, k=3)
 
             # Take only high-relevance chunks
             relevant = []
             for doc, score in results:
-                if score < 1.2:  # Relevance threshold
+                if score < 1.5:
                     relevant.append(doc.page_content)
 
             if relevant:
@@ -134,8 +176,8 @@ class MedlinePlusTools:
         except Exception:
             pass
 
-        # Fallback: return first chunk
-        return chunks[0] if chunks else content[:max_tokens * 4]
+        # Fallback: return all content up to limit
+        return content[:max_tokens * 4]
 
 
 # Global tools instance
@@ -149,7 +191,9 @@ def search_health_topic(topic: str) -> str:
     Use this when you need to find information about a disease, condition, or health concept.
 
     Args:
-        topic: The health topic to search for (e.g., "diabetes", "hypertension", "asthma")
+        topic: The health topic to search for. Use simple, common terms
+               (e.g., "diabetes", "high blood pressure", "asthma", "back pain").
+               Avoid adding extra qualifiers like "symptoms" or "treatment".
 
     Returns:
         Relevant health information from MedlinePlus (filtered for relevance)
@@ -171,17 +215,19 @@ def search_symptoms(symptoms: str) -> str:
     Use this when the user describes symptoms and you need to find relevant information.
 
     Args:
-        symptoms: Description of symptoms (e.g., "chest pain", "fever and cough")
+        symptoms: The primary symptom to search for. Use simple terms
+                  (e.g., "chest pain", "fever", "headache", "cough").
+                  For multiple symptoms, use the single most prominent one.
 
     Returns:
         Relevant symptom information from MedlinePlus (filtered for relevance)
     """
-    # Extract main symptom keyword
-    main_symptom = symptoms.split()[0] if symptoms else ""
-    result = _tools_instance._scrape_topic_page(symptoms.replace(' ', ''))
+    # Try the symptom as-is first (preserving spaces for search)
+    result = _tools_instance._scrape_topic_page(symptoms)
 
     if not result:
         # Try with first keyword
+        main_symptom = symptoms.split()[0] if symptoms else ""
         result = _tools_instance._scrape_topic_page(main_symptom)
 
     if result:
@@ -199,7 +245,10 @@ def search_treatment_info(condition: str) -> str:
     Use this when the user asks about treatments, medications, or therapies.
 
     Args:
-        condition: The condition to find treatment info for (e.g., "diabetes treatment")
+        condition: The condition name to find treatment info for. Use the simple
+                   condition name only (e.g., "diabetes", "asthma", "arthritis").
+                   Do NOT include the word "treatment" — this tool already filters
+                   for treatment content.
 
     Returns:
         Treatment-related information from MedlinePlus (filtered for relevance)

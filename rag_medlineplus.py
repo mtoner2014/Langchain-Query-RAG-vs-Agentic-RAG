@@ -4,7 +4,9 @@ Retrieves relevant healthcare information and augments LLM responses.
 """
 
 import os
+import re
 import requests
+from urllib.parse import urlparse, parse_qs, unquote
 from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
@@ -34,33 +36,36 @@ class MedlinePlusScraper:
 
     def search_topics(self, query: str, max_results: int = 3) -> List[str]:
         """Search MedlinePlus and return relevant page URLs."""
-        # Use the health topics search
-        search_url = f"{self.BASE_URL}/search/search_results.html"
         params = {
+            'v:project': 'medlineplus',
+            'v:sources': 'medlineplus-bundle',
             'query': query,
-            'limit': max_results
         }
 
         try:
-            response = self.session.get(search_url, params=params, timeout=10)
+            response = self.session.get(self.SEARCH_URL, params=params, timeout=10)
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            # Extract links from search results
             urls = []
-            # Look for health topic links
             for link in soup.find_all('a', href=True):
                 href = link['href']
-                if '/healthtopics/' in href or '/medlineplus/' in href:
-                    full_url = href if href.startswith('http') else f"{self.BASE_URL}{href}"
-                    if full_url not in urls:
-                        urls.append(full_url)
-                        if len(urls) >= max_results:
-                            break
+                # Search results use redirect URLs with the real URL in a 'url' param
+                if 'v:frame=redirect' in href or 'v%3aframe=redirect' in href:
+                    parsed = urlparse(href)
+                    qs = parse_qs(parsed.query)
+                    target = qs.get('url', [None])[0]
+                    if target:
+                        target = unquote(target)
+                        if re.match(r'https://medlineplus\.gov/[a-zA-Z]+\.html$', target):
+                            if target not in urls:
+                                urls.append(target)
+                                if len(urls) >= max_results:
+                                    break
 
             # Fallback: construct direct topic URL
             if not urls:
-                topic_slug = query.lower().replace(' ', '')
-                urls = [f"{self.BASE_URL}/healthtopics/{topic_slug}.html"]
+                topic_slug = query.lower().replace(' ', '').replace('-', '')
+                urls = [f"{self.BASE_URL}/{topic_slug}.html"]
 
             return urls
         except Exception as e:
@@ -87,35 +92,25 @@ class MedlinePlusScraper:
             if title_tag:
                 title = title_tag.get_text(strip=True)
 
-            # Extract main content - focus on key sections
+            # Extract content from the topic-summary div
             content_parts = []
 
-            # Look for the main article content
-            main_content = soup.find('article') or soup.find('div', {'id': 'topic-summary'}) or soup.find('main')
-
-            if main_content:
-                # Extract section summaries (more token efficient)
-                for section in main_content.find_all(['section', 'div'], class_=['mp-content', 'section']):
-                    # Get section header
-                    header = section.find(['h2', 'h3'])
-                    header_text = header.get_text(strip=True) if header else ""
-
-                    # Get first paragraph of each section (token efficient!)
-                    paragraphs = section.find_all('p', limit=2)
-                    section_text = ' '.join(p.get_text(strip=True) for p in paragraphs)
-
-                    if section_text:
-                        content_parts.append(f"{header_text}: {section_text}" if header_text else section_text)
+            topic_summary = soup.find('div', {'id': 'topic-summary'})
+            if topic_summary:
+                for child in topic_summary.children:
+                    if not hasattr(child, 'name') or not child.name:
+                        continue
+                    if child.name == 'h3':
+                        content_parts.append(f"\n{child.get_text(strip=True)}")
+                    elif child.name in ['p', 'ul', 'ol']:
+                        text = child.get_text(strip=True)
+                        if text and len(text) > 20:
+                            content_parts.append(text[:500])
 
             # Fallback: get all paragraphs but limit them
             if not content_parts:
                 paragraphs = soup.find_all('p', limit=10)
                 content_parts = [p.get_text(strip=True) for p in paragraphs if len(p.get_text(strip=True)) > 50]
-
-            # Also look for summary/definition sections
-            summary = soup.find('div', {'class': 'summary'})
-            if summary:
-                content_parts.insert(0, summary.get_text(strip=True))
 
             content = '\n\n'.join(content_parts[:8])  # Limit to 8 sections max
 
@@ -133,24 +128,22 @@ class MedlinePlusScraper:
         """Fetch health information for a query."""
         results = []
 
-        # Try direct topic URL first
+        # Try direct topic URL first (fast path for exact matches)
         direct_url = self.get_topic_url(query)
         page_data = self.scrape_page(direct_url)
         if page_data and page_data['content']:
             results.append(page_data)
+            return results
 
-        # Also try common health topic patterns
-        alt_urls = [
-            f"{self.BASE_URL}/healthtopics/{query.lower().replace(' ', '')}.html",
-            f"{self.BASE_URL}/{query.lower().replace(' ', '')}.html",
-        ]
-
-        for url in alt_urls:
+        # Direct URL failed — search MedlinePlus for the right page
+        search_urls = self.search_topics(query)
+        for url in search_urls:
             if url != direct_url:
                 page_data = self.scrape_page(url)
                 if page_data and page_data['content']:
                     results.append(page_data)
-                    break
+                    if len(results) >= 2:
+                        break
 
         return results
 
@@ -160,7 +153,7 @@ class MedlinePlusRAG:
 
     def __init__(self, model_name: str = "gpt-4o-mini"):
         self.scraper = MedlinePlusScraper()
-        self.embeddings = OpenAIEmbeddings()
+        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         self.llm = ChatOpenAI(model=model_name, temperature=0.1)
         self.text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=500,  # Small chunks for efficiency

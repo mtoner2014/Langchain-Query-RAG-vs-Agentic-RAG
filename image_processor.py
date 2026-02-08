@@ -4,6 +4,8 @@ Extracts medical context from uploaded images using gpt-4o-mini vision.
 """
 
 import base64
+from typing import List
+from pydantic import BaseModel, Field
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage
 from dotenv import load_dotenv
@@ -48,11 +50,21 @@ IMPORTANT:
 - Do NOT diagnose. Only describe and extract."""
 
 
+class ImageAnalysisResult(BaseModel):
+    """Structured output schema for medical image analysis."""
+    image_type: str = Field(description="One of: lab_report, prescription, symptom_photo, other")
+    extracted_text: str = Field(description="All readable text from the image, preserving numbers and values")
+    medical_terms: List[str] = Field(description="List of medical terms, drug names, test names, conditions visible")
+    summary: str = Field(description="2-3 sentence plain-language summary of what this image shows")
+    search_query: str = Field(description="A concise search query (3-8 words) to look up relevant health information about the key topics in this image")
+
+
 class MedicalImageAnalyzer:
     """Analyzes medical images using gpt-4o-mini vision capabilities."""
 
     def __init__(self, model_name: str = "gpt-4o-mini"):
         self.llm = ChatOpenAI(model=model_name, temperature=0.1)
+        self.structured_llm = self.llm.with_structured_output(ImageAnalysisResult)
 
     def analyze_image(
         self, image_bytes: bytes, mime_type: str, user_text: str = ""
@@ -83,39 +95,14 @@ class MedicalImageAnalyzer:
             ]
         )
 
-        response = self.llm.invoke([message])
-        return self._parse_response(response.content)
+        result = self.structured_llm.invoke([message])
 
-    def _parse_response(self, response_text: str) -> dict:
-        """Parse the structured response from the vision model."""
-        result = {
-            "image_type": "other",
-            "extracted_text": "",
-            "medical_terms": [],
-            "summary": "",
-            "search_query": "",
-        }
+        # Fallback: derive search_query from medical_terms if empty
+        response = result.model_dump()
+        if not response["search_query"] and response["medical_terms"]:
+            response["search_query"] = " ".join(response["medical_terms"][:3])
 
-        for line in response_text.strip().split("\n"):
-            line = line.strip()
-            if line.startswith("IMAGE_TYPE:"):
-                result["image_type"] = line.split(":", 1)[1].strip().lower()
-            elif line.startswith("EXTRACTED_TEXT:"):
-                result["extracted_text"] = line.split(":", 1)[1].strip()
-            elif line.startswith("MEDICAL_TERMS:"):
-                terms_str = line.split(":", 1)[1].strip()
-                result["medical_terms"] = [
-                    t.strip() for t in terms_str.split(",") if t.strip()
-                ]
-            elif line.startswith("SUMMARY:"):
-                result["summary"] = line.split(":", 1)[1].strip()
-            elif line.startswith("SEARCH_QUERY:"):
-                result["search_query"] = line.split(":", 1)[1].strip()
-
-        if not result["search_query"] and result["medical_terms"]:
-            result["search_query"] = " ".join(result["medical_terms"][:3])
-
-        return result
+        return response
 
 
 def validate_upload(file_name: str, file_size: int) -> str | None:

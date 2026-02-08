@@ -3,7 +3,6 @@ RAG System for MedlinePlus Healthcare Information
 Retrieves relevant healthcare information and augments LLM responses.
 """
 
-import os
 import re
 import requests
 from urllib.parse import urlparse, parse_qs, unquote
@@ -11,13 +10,21 @@ from bs4 import BeautifulSoup
 from typing import List, Dict, Optional
 from dotenv import load_dotenv
 
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_core.documents import Document
+import os
+import shutil
+import tempfile
+
+from langchain_openai import ChatOpenAI
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.documents import Document
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_chroma import Chroma
+from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+
+
 
 load_dotenv()
 
@@ -28,14 +35,109 @@ class MedlinePlusScraper:
     BASE_URL = "https://medlineplus.gov"
     SEARCH_URL = "https://vsearch.nlm.nih.gov/vivisimo/cgi-bin/query-meta"
 
+    # Map common medical terms/synonyms to their MedlinePlus page slugs
+    TOPIC_ALIASES = {
+        'hypertension': 'highbloodpressure',
+        'high blood pressure': 'highbloodpressure',
+        'hypotension': 'lowbloodpressure',
+        'low blood pressure': 'lowbloodpressure',
+        'hyperlipidemia': 'cholesterol',
+        'high cholesterol': 'cholesterol',
+        'dyslipidemia': 'cholesterol',
+        'diabetes mellitus': 'diabetes',
+        'type 2 diabetes': 'diabetestype2',
+        'type 1 diabetes': 'diabetestype1',
+        'myocardial infarction': 'heartattack',
+        'heart attack': 'heartattack',
+        'cerebrovascular accident': 'stroke',
+        'cva': 'stroke',
+        'uri': 'commoncold',
+        'common cold': 'commoncold',
+        'gerd': 'gastroesophagealreflux',
+        'acid reflux': 'gastroesophagealreflux',
+        'uti': 'urinarytractinfections',
+        'urinary tract infection': 'urinarytractinfections',
+        'copd': 'copd',
+        'obesity': 'obesity',
+        'overweight': 'obesity',
+        'depression': 'depression',
+        'anxiety': 'anxiety',
+        'insomnia': 'insomnia',
+        'sleep disorders': 'sleepdisorders',
+        'migraine': 'migraine',
+        'migraines': 'migraine',
+        'alzheimers': 'alzheimersdisease',
+        "alzheimer's": 'alzheimersdisease',
+        "alzheimer's disease": 'alzheimersdisease',
+        'parkinsons': 'parkinsonsdisease',
+        "parkinson's": 'parkinsonsdisease',
+        "parkinson's disease": 'parkinsonsdisease',
+        'osteoporosis': 'osteoporosis',
+        'arthritis': 'arthritis',
+        'rheumatoid arthritis': 'rheumatoidarthritis',
+        'osteoarthritis': 'osteoarthritis',
+        'pneumonia': 'pneumonia',
+        'bronchitis': 'bronchitis',
+        'anemia': 'anemia',
+        'hypothyroidism': 'hypothyroidism',
+        'hyperthyroidism': 'hyperthyroidism',
+        'eczema': 'eczema',
+        'psoriasis': 'psoriasis',
+        'kidney disease': 'kidneydiseases',
+        'chronic kidney disease': 'chronickidneydisease',
+        'liver disease': 'liverdiseases',
+        'hepatitis': 'hepatitis',
+        'hiv': 'hivaids',
+        'aids': 'hivaids',
+        'tuberculosis': 'tuberculosis',
+        'tb': 'tuberculosis',
+        'cancer': 'cancer',
+        'leukemia': 'leukemia',
+        'lymphoma': 'lymphoma',
+        'epilepsy': 'epilepsy',
+        'seizures': 'seizures',
+        'allergies': 'allergy',
+        'allergy': 'allergy',
+    }
+
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Educational RAG System)'
         })
 
+    @staticmethod
+    def _relevance_score(query: str, link_text: str, url: str) -> float:
+        """Score how relevant a search result is to the query (higher is better)."""
+        query_words = set(query.lower().split())
+        link_words = set(link_text.lower().split())
+        # Extract the slug from the URL (e.g. "highbloodpressure" from topic URLs,
+        # or "a682159" from drug URLs like /druginfo/meds/a682159.html)
+        slug_match = re.search(r'medlineplus\.gov/(?:druginfo/\w+/)?([a-zA-Z0-9]+)\.html$', url)
+        slug = slug_match.group(1).lower() if slug_match else ''
+
+        # Word overlap between query and link text
+        overlap = query_words & link_words
+        score = len(overlap) * 2.0
+
+        # Bonus if the slug contains any query word
+        for word in query_words:
+            if word in slug:
+                score += 3.0
+
+        # Bonus if the link text contains the full query as a substring
+        if query.lower() in link_text.lower():
+            score += 5.0
+
+        # Penalty for very generic pages (these tend to be peripheral)
+        generic_slugs = {'heartdiseases', 'heartdisease', 'healthtopics'}
+        if slug in generic_slugs:
+            score -= 2.0
+
+        return score
+
     def search_topics(self, query: str, max_results: int = 3) -> List[str]:
-        """Search MedlinePlus and return relevant page URLs."""
+        """Search MedlinePlus and return relevant page URLs, ranked by relevance."""
         params = {
             'v:project': 'medlineplus',
             'v:sources': 'medlineplus-bundle',
@@ -46,7 +148,8 @@ class MedlinePlusScraper:
             response = self.session.get(self.SEARCH_URL, params=params, timeout=10)
             soup = BeautifulSoup(response.text, 'html.parser')
 
-            urls = []
+            candidates = []  # (url, link_text) pairs
+            seen = set()
             for link in soup.find_all('a', href=True):
                 href = link['href']
                 # Search results use redirect URLs with the real URL in a 'url' param
@@ -56,11 +159,21 @@ class MedlinePlusScraper:
                     target = qs.get('url', [None])[0]
                     if target:
                         target = unquote(target)
-                        if re.match(r'https://medlineplus\.gov/[a-zA-Z]+\.html$', target):
-                            if target not in urls:
-                                urls.append(target)
-                                if len(urls) >= max_results:
-                                    break
+                        if re.match(r'https://medlineplus\.gov/(?:[a-zA-Z]+|druginfo/\w+/\w+)\.html$', target):
+                            if target not in seen:
+                                seen.add(target)
+                                link_text = link.get_text(strip=True)
+                                candidates.append((target, link_text))
+
+            # Rank candidates by relevance to the query
+            if candidates:
+                candidates.sort(
+                    key=lambda c: self._relevance_score(query, c[1], c[0]),
+                    reverse=True,
+                )
+                urls = [c[0] for c in candidates[:max_results]]
+            else:
+                urls = []
 
             # Fallback: construct direct topic URL
             if not urls:
@@ -73,8 +186,11 @@ class MedlinePlusScraper:
             return []
 
     def get_topic_url(self, topic: str) -> str:
-        """Construct a direct URL for a health topic."""
-        topic_slug = topic.lower().replace(' ', '').replace('-', '')
+        """Construct a direct URL for a health topic, checking aliases first."""
+        key = topic.lower().strip()
+        if key in self.TOPIC_ALIASES:
+            return f"{self.BASE_URL}/{self.TOPIC_ALIASES[key]}.html"
+        topic_slug = key.replace(' ', '').replace('-', '')
         return f"{self.BASE_URL}/{topic_slug}.html"
 
     def scrape_page(self, url: str) -> Optional[Dict]:
@@ -92,7 +208,7 @@ class MedlinePlusScraper:
             if title_tag:
                 title = title_tag.get_text(strip=True)
 
-            # Extract content from the topic-summary div
+            # Extract content from the topic-summary div (health topic pages)
             content_parts = []
 
             topic_summary = soup.find('div', {'id': 'topic-summary'})
@@ -104,6 +220,20 @@ class MedlinePlusScraper:
                         content_parts.append(f"\n{child.get_text(strip=True)}")
                     elif child.name in ['p', 'ul', 'ol']:
                         text = child.get_text(strip=True)
+                        if text and len(text) > 20:
+                            content_parts.append(text[:500])
+
+            # Fallback: drug info pages use div.section with div.section-body
+            if not content_parts:
+                sections = soup.find_all('div', class_='section')
+                for section in sections:
+                    heading = section.find(['h2', 'h3'])
+                    if heading:
+                        content_parts.append(f"\n{heading.get_text(strip=True)}")
+                    body = section.find('div', class_='section-body')
+                    container = body if body else section
+                    for elem in container.find_all(['p', 'ul', 'ol']):
+                        text = elem.get_text(strip=True)
                         if text and len(text) > 20:
                             content_parts.append(text[:500])
 
@@ -124,137 +254,239 @@ class MedlinePlusScraper:
             print(f"Scraping error for {url}: {e}")
             return None
 
+    def _extract_topics(self, query: str) -> List[str]:
+        """Extract individual health topics from a natural language query."""
+        text = query.lower().strip()
+        text = re.sub(r'[?.,!]', '', text)
+
+        # Split on "and" / "or" connectors first
+        parts = re.split(r'\s+and\s+|\s+or\s+', text)
+
+        # Strip common non-medical words from each part
+        stop_words = {
+            'what', 'how', 'why', 'should', 'can', 'do', 'does', 'if', 'i',
+            'have', 'had', 'has', 'am', 'about', 'the', 'a', 'an', 'my', 'is',
+            'are', 'it', 'to', 'for', 'with', 'in', 'on', 'of', 'be', 'been',
+            'being', 'get', 'getting', 'when', 'where', 'me', 'we', 'they',
+        }
+
+        topics = []
+        for part in parts:
+            words = [w for w in part.split() if w not in stop_words]
+            topic = ' '.join(words).strip()
+            if len(topic) > 2:
+                topics.append(topic)
+
+        return topics if topics else [query]
+
     def fetch_health_info(self, query: str) -> List[Dict]:
         """Fetch health information for a query."""
+        topics = self._extract_topics(query)
         results = []
+        seen_urls = set()
 
-        # Try direct topic URL first (fast path for exact matches)
-        direct_url = self.get_topic_url(query)
-        page_data = self.scrape_page(direct_url)
-        if page_data and page_data['content']:
-            results.append(page_data)
-            return results
-
-        # Direct URL failed — search MedlinePlus for the right page
-        search_urls = self.search_topics(query)
-        for url in search_urls:
-            if url != direct_url:
-                page_data = self.scrape_page(url)
+        for topic in topics:
+            # Try direct topic URL first (fast path for exact matches)
+            direct_url = self.get_topic_url(topic)
+            if direct_url not in seen_urls:
+                page_data = self.scrape_page(direct_url)
                 if page_data and page_data['content']:
                     results.append(page_data)
-                    if len(results) >= 2:
+                    seen_urls.add(direct_url)
+                    continue
+
+            # Direct URL failed — search MedlinePlus for the right page
+            search_urls = self.search_topics(topic)
+            for url in search_urls:
+                if url not in seen_urls:
+                    page_data = self.scrape_page(url)
+                    if page_data and page_data['content']:
+                        results.append(page_data)
+                        seen_urls.add(url)
                         break
+
+        # For multi-topic queries, also search the combined query for cross-topic pages
+        if len(topics) > 1:
+            combined_urls = self.search_topics(query, max_results=2)
+            for url in combined_urls:
+                if url not in seen_urls:
+                    page_data = self.scrape_page(url)
+                    if page_data and page_data['content']:
+                        results.append(page_data)
+                        seen_urls.add(url)
 
         return results
 
 
 class MedlinePlusRAG:
-    """RAG system for healthcare Q&A using MedlinePlus."""
+    """RAG system for healthcare Q&A using MedlinePlus.
+
+    Uses LangChain LCEL retrieval pipeline with:
+    - sentence-transformers/all-MiniLM-L6-v2 for embeddings (local, no GPU needed)
+    - Chroma as the ephemeral vector store
+    - cross-encoder/ms-marco-MiniLM-L-6-v2 for reranking retrieved chunks
+    """
+
+    TOP_K = 4
+    RERANK_FETCH_K = 10
 
     def __init__(self, model_name: str = "gpt-4o-mini"):
         self.scraper = MedlinePlusScraper()
-        self.embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
         self.llm = ChatOpenAI(model=model_name, temperature=0.1)
-        self.text_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=500,  # Small chunks for efficiency
-            chunk_overlap=50,
-            separators=["\n\n", "\n", ". ", " "]
+        self.embeddings = HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2",
         )
-        self.vector_store = None
+        self.text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=500,
+            chunk_overlap=50,
+            separators=["\n\n", "\n", ". ", " ", ""],
+        )
 
-    def _create_documents(self, health_info: List[Dict]) -> List[Document]:
-        """Convert scraped info to LangChain documents."""
+        # Cross-encoder for reranking retrieved chunks
+        self.cross_encoder = HuggingFaceCrossEncoder(
+            model_name="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        )
+
+        self.last_retrieval_debug = []
+
+    def _build_retriever(self, query: str):
+        """Scrape MedlinePlus, chunk, embed into Chroma, and return a retriever.
+
+        Returns:
+            Tuple of (retriever | None, tmp_dir_path | chunks_list | None).
+        """
+        health_info = self.scraper.fetch_health_info(query)
+        self.last_retrieval_debug = health_info
+
+        if not health_info:
+            return None, None
+
         documents = []
         for info in health_info:
             if info and info.get('content'):
-                doc = Document(
+                documents.append(Document(
                     page_content=info['content'],
-                    metadata={
-                        'title': info.get('title', ''),
-                        'source': info.get('url', '')
-                    }
-                )
-                documents.append(doc)
-        return documents
-
-    def _filter_chunks(self, chunks: List[Document], query: str, top_k: int = 3) -> List[Document]:
-        """Filter chunks to only the most relevant ones (TOKEN EFFICIENT!)."""
-        if not chunks:
-            return []
-
-        # Create temporary vector store for similarity search
-        temp_store = FAISS.from_documents(chunks, self.embeddings)
-
-        # Get only top_k most relevant chunks
-        relevant_chunks = temp_store.similarity_search_with_score(query, k=top_k)
-
-        # Filter by similarity score threshold (lower is better for FAISS L2 distance)
-        filtered = []
-        for doc, score in relevant_chunks:
-            if score < 1.5:  # Only include highly relevant chunks
-                filtered.append(doc)
-
-        return filtered if filtered else [relevant_chunks[0][0]]  # At least return best match
-
-    def build_context(self, query: str) -> str:
-        """Build context from MedlinePlus for the query."""
-        # Fetch health information
-        health_info = self.scraper.fetch_health_info(query)
-
-        if not health_info:
-            return ""
-
-        # Convert to documents
-        documents = self._create_documents(health_info)
-
+                    metadata={'title': info.get('title', ''), 'url': info.get('url', '')},
+                ))
         if not documents:
-            return ""
+            return None, None
 
-        # Split into chunks
         chunks = self.text_splitter.split_documents(documents)
 
-        # Filter to most relevant chunks (TOKEN EFFICIENT!)
-        relevant_chunks = self._filter_chunks(chunks, query, top_k=3)
+        # Short-circuit: if few chunks, skip vector store overhead
+        if len(chunks) <= self.TOP_K:
+            return None, chunks
 
-        # Build context string
-        context_parts = []
-        for chunk in relevant_chunks:
-            source = chunk.metadata.get('title', 'MedlinePlus')
-            context_parts.append(f"[Source: {source}]\n{chunk.page_content}")
+        # Create ephemeral Chroma store in a temp directory
+        tmp_dir = tempfile.mkdtemp()
 
-        return "\n\n---\n\n".join(context_parts)
+        vectorstore = Chroma.from_documents(
+            documents=chunks,
+            embedding=self.embeddings,
+            persist_directory=tmp_dir,
+            collection_name="medlineplus_filter",
+        )
+
+        # Fetch extra candidates for cross-encoder reranking
+        fetch_k = min(len(chunks), self.RERANK_FETCH_K)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": fetch_k})
+        return retriever, tmp_dir
+
+    def _rerank(self, query: str, docs: List[Document]) -> List[Document]:
+        """Rerank documents using the cross-encoder model."""
+        if len(docs) <= self.TOP_K:
+            return docs
+        pairs = [(query, doc.page_content) for doc in docs]
+        scores = self.cross_encoder.score(pairs)
+        scored = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+        return [doc for doc, _ in scored[: self.TOP_K]]
+
+    @staticmethod
+    def _format_chunks(docs: List[Document]) -> tuple[str, List[Dict]]:
+        """Format Documents into a context string and deduplicated source list."""
+        sources: List[Dict] = []
+        seen_urls: set = set()
+        context_parts: List[str] = []
+
+        for doc in docs:
+            url = doc.metadata.get("url", "")
+            title = doc.metadata.get("title", "MedlinePlus")
+            if url and url not in seen_urls:
+                sources.append({"title": title, "url": url})
+                seen_urls.add(url)
+            context_parts.append(f"[Source: {title}]\n{doc.page_content}")
+
+        return "\n\n---\n\n".join(context_parts), sources
 
     def query(self, user_question: str) -> str:
         """Answer a healthcare question using RAG."""
+        result, tmp_path_or_chunks = self._build_retriever(user_question)
 
-        # Build context from MedlinePlus
-        context = self.build_context(user_question)
+        # No content found at all
+        if result is None and tmp_path_or_chunks is None:
+            return (
+                "I couldn't find relevant information on MedlinePlus for your question. "
+                "Please try rephrasing or consult a healthcare professional."
+            )
 
-        # Create prompt template
-        prompt = ChatPromptTemplate.from_template("""You are a helpful healthcare information assistant.
-Use the following context from MedlinePlus to answer the user's question.
-If the context doesn't contain relevant information, say so and provide general guidance.
-Always recommend consulting a healthcare professional for medical advice.
+        try:
+            # Determine docs: either short-circuited chunks or retriever results
+            if result is None:
+                # Short-circuit path — few chunks, no vector store needed
+                docs = tmp_path_or_chunks
+                tmp_path = None
+            else:
+                # Retriever path — invoke retriever then rerank
+                retriever = result
+                tmp_path = tmp_path_or_chunks
+                docs = retriever.invoke(user_question)
+                docs = self._rerank(user_question, docs)
 
-Context from MedlinePlus:
-{context}
+            context, sources = self._format_chunks(docs)
 
-User Question: {question}
+            # LCEL RAG chain: retriever context → prompt → LLM → parse
+            prompt = ChatPromptTemplate.from_template(
+                "You are a knowledgeable healthcare information assistant.\n"
+                "Use the following context from MedlinePlus to answer the "
+                "user's question in detail.\n\n"
+                "Instructions:\n"
+                "- Provide specific, evidence-based information drawn from the context.\n"
+                "- When the question involves multiple conditions or topics, dedicate a "
+                "section to each and then explain how they may interact or influence "
+                "each other.\n"
+                "- Use clear headings or bullet points to organize the response.\n"
+                "- Include relevant details such as symptoms, causes, treatment options, "
+                "and lifestyle considerations.\n"
+                "- If the context doesn't fully cover the question, clearly state what "
+                "is and isn't covered.\n"
+                "- Always recommend consulting a healthcare professional for personalized "
+                "medical advice.\n\n"
+                "Context from MedlinePlus:\n{context}\n\n"
+                "User Question: {question}\n\nDetailed Answer:"
+            )
 
-Answer (be concise and helpful):""")
+            chain = (
+                {"context": lambda _: context, "question": RunnablePassthrough()}
+                | prompt
+                | self.llm
+                | StrOutputParser()
+            )
 
-        # Create chain
-        chain = (
-            {"context": lambda x: context, "question": RunnablePassthrough()}
-            | prompt
-            | self.llm
-            | StrOutputParser()
-        )
+            response = chain.invoke(user_question)
 
-        # Get response
-        response = chain.invoke(user_question)
+            # Append source links
+            if sources:
+                response += "\n\n**Relevant MedlinePlus Articles:**"
+                for source in sources:
+                    response += f"\n- [{source['title']}]({source['url']})"
 
-        return response
+            return response
+        finally:
+            if result is not None and tmp_path_or_chunks:
+                try:
+                    shutil.rmtree(tmp_path_or_chunks, ignore_errors=True)
+                except OSError:
+                    pass
 
 
 def main():

@@ -432,16 +432,15 @@ with st.sidebar:
         st.markdown("""
         <div class="info-card">
             <h4>Non-Agentic RAG</h4>
-            <p>A direct retrieval pipeline that scrapes MedlinePlus,
-            splits content into chunks, filters by FAISS similarity,
-            and feeds the most relevant context to the LLM.
+            <p>A direct retrieval pipeline that scrapes MedlinePlus
+            and feeds the relevant content to the LLM.
             Fast and straightforward.</p>
         </div>
         """, unsafe_allow_html=True)
         st.markdown("""
         <div class="stat-row">
-            <span class="stat-pill">FAISS vector search</span>
-            <span class="stat-pill">Top-3 chunks</span>
+            <span class="stat-pill">Direct retrieval</span>
+            <span class="stat-pill">MedlinePlus content</span>
             <span class="stat-pill">Single pass</span>
         </div>
         """, unsafe_allow_html=True)
@@ -659,7 +658,8 @@ if prompt or has_image:
                         response = rag.query(search_query)
                         elapsed = time.time() - start
 
-                    st.markdown("**Related Health Information from MedlinePlus:**")
+                    if "medlineplus.gov" in response.lower():
+                        st.markdown("**Related Health Information from MedlinePlus:**")
                     st.markdown(response)
                     st.caption(
                         f"Response generated in {elapsed:.1f}s via "
@@ -670,15 +670,47 @@ if prompt or has_image:
                     st.warning(response)
                     elapsed = 0
 
+                has_medlineplus = "medlineplus.gov" in response.lower()
+                health_info_header = (
+                    "**Related Health Information from MedlinePlus:**"
+                    if has_medlineplus
+                    else "**Response:**"
+                )
                 full_response = (
                     f"**Image Analysis:** {image_result['summary']}\n\n"
                     f"**Extracted Terms:** {', '.join(image_result['medical_terms'])}\n\n"
-                    f"**Related Health Information:**\n{response}"
+                    f"{health_info_header}\n{response}"
                 )
                 st.session_state.messages.append(
                     {"role": "assistant", "content": full_response}
                 )
                 st.session_state.query_count += 1
+
+                # Debug: show raw retrieved content before LLM transformation
+                with st.expander("Raw Content Retrieved from MedlinePlus"):
+                    debug = getattr(rag, "last_retrieval_debug", [])
+                    if not debug:
+                        st.info("No content was retrieved from MedlinePlus.")
+                    elif is_agentic:
+                        for i, item in enumerate(debug):
+                            if item["type"] == "tool_call":
+                                st.markdown(f"**Tool Call:** `{item['tool']}`")
+                                st.code(str(item["args"]), language="json")
+                            elif item["type"] == "tool_result":
+                                st.markdown(f"**Tool Result from** `{item['tool']}`:")
+                                st.code(item["content"], language="text")
+                            if i < len(debug) - 1:
+                                st.divider()
+                    else:
+                        for i, page in enumerate(debug):
+                            title = page.get("title", "Unknown")
+                            url = page.get("url", "")
+                            content = page.get("content", "")
+                            st.markdown(f"**Page {i+1}: {title}**")
+                            st.caption(url)
+                            st.code(content, language="text")
+                            if i < len(debug) - 1:
+                                st.divider()
 
             else:
                 # Text-only: existing behavior
@@ -701,6 +733,32 @@ if prompt or has_image:
                         {"role": "assistant", "content": response}
                     )
                     st.session_state.query_count += 1
+
+                # Debug: show raw retrieved content before LLM transformation
+                with st.expander("Raw Content Retrieved from MedlinePlus"):
+                    debug = getattr(rag, "last_retrieval_debug", [])
+                    if not debug:
+                        st.info("No content was retrieved from MedlinePlus.")
+                    elif is_agentic:
+                        for i, item in enumerate(debug):
+                            if item["type"] == "tool_call":
+                                st.markdown(f"**Tool Call:** `{item['tool']}`")
+                                st.code(str(item["args"]), language="json")
+                            elif item["type"] == "tool_result":
+                                st.markdown(f"**Tool Result from** `{item['tool']}`:")
+                                st.code(item["content"], language="text")
+                            if i < len(debug) - 1:
+                                st.divider()
+                    else:
+                        for i, page in enumerate(debug):
+                            title = page.get("title", "Unknown")
+                            url = page.get("url", "")
+                            content = page.get("content", "")
+                            st.markdown(f"**Page {i+1}: {title}**")
+                            st.caption(url)
+                            st.code(content, language="text")
+                            if i < len(debug) - 1:
+                                st.divider()
 
         except Exception as e:
             error_msg = f"An error occurred: {str(e)}"

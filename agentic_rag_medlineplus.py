@@ -11,6 +11,7 @@ from bs4 import BeautifulSoup
 from typing import List, Dict, Optional, Annotated
 from dotenv import load_dotenv
 
+import shutil
 import tempfile
 
 from langchain_openai import ChatOpenAI
@@ -19,7 +20,7 @@ from langchain_community.cross_encoders import HuggingFaceCrossEncoder
 from langchain_core.tools import tool
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_milvus import Milvus
+from langchain_chroma import Chroma
 from langchain.agents import create_agent
 from langchain_core.messages import HumanMessage, AIMessage, ToolMessage
 
@@ -141,6 +142,13 @@ class MedlinePlusTools:
         if query.lower() in link_text.lower():
             score += 5.0
 
+        # Boost if the URL slug matches a known alias for any query term
+        # (e.g. query has "hypertension" and slug is "highbloodpressure")
+        for qw in query_words:
+            alias_slug = MedlinePlusTools.TOPIC_ALIASES.get(qw)
+            if alias_slug and alias_slug == slug:
+                score += 5.0
+
         # Penalty for very generic pages
         generic_slugs = {'heartdiseases', 'heartdisease', 'healthtopics'}
         if slug in generic_slugs:
@@ -202,6 +210,13 @@ class MedlinePlusTools:
         if cache_key in self.TOPIC_ALIASES:
             alias_slug = self.TOPIC_ALIASES[cache_key]
             urls_to_try.append(f"{self.BASE_URL}/{alias_slug}.html")
+        else:
+            # Check if any known alias appears within the topic
+            for alias in sorted(self.TOPIC_ALIASES, key=len, reverse=True):
+                if re.search(r'\b' + re.escape(alias) + r'\b', cache_key):
+                    alias_slug = self.TOPIC_ALIASES[alias]
+                    urls_to_try.append(f"{self.BASE_URL}/{alias_slug}.html")
+                    break
 
         slug = cache_key.replace(' ', '').replace('-', '')
         direct_url = f"{self.BASE_URL}/{slug}.html"
@@ -310,21 +325,18 @@ class MedlinePlusTools:
         )
         chunks = self.text_splitter.split_documents([doc])
 
-        # Short-circuit: if few chunks, skip Milvus overhead
+        # Short-circuit: if few chunks, skip vector store overhead
         if len(chunks) <= self.TOP_K:
             return "\n\n".join(c.page_content for c in chunks)
 
-        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
-        tmp_path = tmp.name
-        tmp.close()
+        tmp_dir = tempfile.mkdtemp()
 
         try:
-            vectorstore = Milvus.from_documents(
+            vectorstore = Chroma.from_documents(
                 documents=chunks,
                 embedding=self.embeddings,
+                persist_directory=tmp_dir,
                 collection_name="medlineplus_tool_filter",
-                connection_args={"uri": tmp_path},
-                drop_old=True,
             )
             # Fetch extra candidates for cross-encoder reranking
             fetch_k = min(len(chunks), self.RERANK_FETCH_K)
@@ -338,7 +350,7 @@ class MedlinePlusTools:
             return content[:800]
         finally:
             try:
-                os.unlink(tmp_path)
+                shutil.rmtree(tmp_dir, ignore_errors=True)
             except OSError:
                 pass
 

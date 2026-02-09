@@ -129,6 +129,13 @@ class MedlinePlusScraper:
         if query.lower() in link_text.lower():
             score += 5.0
 
+        # Boost if the URL slug matches a known alias for any query term
+        # (e.g. query has "hypertension" and slug is "highbloodpressure")
+        for qw in query_words:
+            alias_slug = MedlinePlusScraper.TOPIC_ALIASES.get(qw)
+            if alias_slug and alias_slug == slug:
+                score += 5.0
+
         # Penalty for very generic pages (these tend to be peripheral)
         generic_slugs = {'heartdiseases', 'heartdisease', 'healthtopics'}
         if slug in generic_slugs:
@@ -190,6 +197,11 @@ class MedlinePlusScraper:
         key = topic.lower().strip()
         if key in self.TOPIC_ALIASES:
             return f"{self.BASE_URL}/{self.TOPIC_ALIASES[key]}.html"
+        # Check if any known alias appears as a whole phrase within the topic
+        # (e.g. "hypertension risk factors" contains alias "hypertension")
+        for alias in sorted(self.TOPIC_ALIASES, key=len, reverse=True):
+            if re.search(r'\b' + re.escape(alias) + r'\b', key):
+                return f"{self.BASE_URL}/{self.TOPIC_ALIASES[alias]}.html"
         topic_slug = key.replace(' ', '').replace('-', '')
         return f"{self.BASE_URL}/{topic_slug}.html"
 
@@ -259,15 +271,22 @@ class MedlinePlusScraper:
         text = query.lower().strip()
         text = re.sub(r'[?.,!]', '', text)
 
-        # Split on "and" / "or" connectors first
+        # Keep "and its/their/the" as part of the same topic — these are
+        # qualifiers, not separate topics (e.g. "hypertension and its risk
+        # factors" should stay together, not split into two topics)
+        text = re.sub(r'\s+and\s+(?=(?:its|their|the)\s+)', ' ', text)
+
+        # Split on remaining "and" / "or" connectors
         parts = re.split(r'\s+and\s+|\s+or\s+', text)
 
         # Strip common non-medical words from each part
         stop_words = {
-            'what', 'how', 'why', 'should', 'can', 'do', 'does', 'if', 'i',
-            'have', 'had', 'has', 'am', 'about', 'the', 'a', 'an', 'my', 'is',
-            'are', 'it', 'to', 'for', 'with', 'in', 'on', 'of', 'be', 'been',
-            'being', 'get', 'getting', 'when', 'where', 'me', 'we', 'they',
+            'what', 'how', 'why', 'should', 'can', 'could', 'would', 'do',
+            'does', 'if', 'i', 'have', 'had', 'has', 'am', 'about', 'the',
+            'a', 'an', 'my', 'is', 'are', 'it', 'its', 'to', 'for', 'with',
+            'in', 'on', 'of', 'be', 'been', 'being', 'get', 'getting',
+            'when', 'where', 'me', 'we', 'they', 'their', 'tell', 'know',
+            'explain', 'describe', 'cause', 'causes',
         }
 
         topics = []

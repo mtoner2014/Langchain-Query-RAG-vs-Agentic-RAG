@@ -6,7 +6,6 @@ A medically-themed interface with Agentic and Non-Agentic RAG modes.
 import re
 import streamlit as st
 import time
-from rag_medlineplus import MedlinePlusRAG
 from agentic_rag_medlineplus import AgenticMedlinePlusRAG
 from Vanilla_RAG import VanillaRAG
 from image_processor import MedicalImageAnalyzer, validate_upload
@@ -351,9 +350,7 @@ section[data-testid="stSidebar"] .stRadio > label {
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "rag_mode" not in st.session_state:
-    st.session_state.rag_mode = "Query Expansion RAG"
-if "rag_non_agentic" not in st.session_state:
-    st.session_state.rag_non_agentic = None
+    st.session_state.rag_mode = "Agentic RAG"
 if "rag_agentic" not in st.session_state:
     st.session_state.rag_agentic = None
 if "rag_vanilla" not in st.session_state:
@@ -379,14 +376,10 @@ def get_rag_instance():
         if st.session_state.rag_agentic is None:
             st.session_state.rag_agentic = AgenticMedlinePlusRAG()
         return st.session_state.rag_agentic
-    elif st.session_state.rag_mode == "Vanilla RAG":
+    else:
         if st.session_state.rag_vanilla is None:
             st.session_state.rag_vanilla = VanillaRAG()
         return st.session_state.rag_vanilla
-    else:
-        if st.session_state.rag_non_agentic is None:
-            st.session_state.rag_non_agentic = MedlinePlusRAG()
-        return st.session_state.rag_non_agentic
 
 
 # ── Sidebar ──────────────────────────────────────────────────────────────────
@@ -403,7 +396,7 @@ with st.sidebar:
 
     # Mode selector
     st.markdown("##### Retrieval Mode")
-    rag_options = ["Query Expansion RAG", "Agentic RAG", "Vanilla RAG"]
+    rag_options = ["Agentic RAG", "Vanilla RAG"]
     mode = st.radio(
         "Choose RAG mode",
         options=rag_options,
@@ -436,7 +429,7 @@ with st.sidebar:
             <span class="stat-pill">ReAct reasoning</span>
         </div>
         """, unsafe_allow_html=True)
-    elif st.session_state.rag_mode == "Vanilla RAG":
+    else:
         st.markdown("""
         <div class="info-card">
             <h4>Vanilla RAG</h4>
@@ -450,22 +443,6 @@ with st.sidebar:
         <div class="stat-row">
             <span class="stat-pill">No query expansion</span>
             <span class="stat-pill">Cross-encoder rerank</span>
-            <span class="stat-pill">Single pass</span>
-        </div>
-        """, unsafe_allow_html=True)
-    else:
-        st.markdown("""
-        <div class="info-card">
-            <h4>Query Expansion RAG</h4>
-            <p>A direct retrieval pipeline that scrapes MedlinePlus
-            and feeds the relevant content to the LLM.
-            Fast and straightforward.</p>
-        </div>
-        """, unsafe_allow_html=True)
-        st.markdown("""
-        <div class="stat-row">
-            <span class="stat-pill">Direct retrieval</span>
-            <span class="stat-pill">MedlinePlus content</span>
             <span class="stat-pill">Single pass</span>
         </div>
         """, unsafe_allow_html=True)
@@ -533,10 +510,9 @@ with st.sidebar:
 
 # Header
 is_agentic = st.session_state.rag_mode == "Agentic RAG"
-is_vanilla = st.session_state.rag_mode == "Vanilla RAG"
 badge_class = "mode-agentic" if is_agentic else "mode-nonagentic"
-badge_label = "Agentic" if is_agentic else ("Vanilla" if is_vanilla else "Query Expansion")
-badge_icon = "🤖" if is_agentic else ("🔍" if is_vanilla else "📄")
+badge_label = "Agentic" if is_agentic else "Vanilla"
+badge_icon = "🤖" if is_agentic else "🔍"
 
 st.markdown(f"""
 <div class="med-header">

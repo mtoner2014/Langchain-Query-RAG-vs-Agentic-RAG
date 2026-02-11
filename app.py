@@ -8,6 +8,7 @@ import streamlit as st
 import time
 from rag_medlineplus import MedlinePlusRAG
 from agentic_rag_medlineplus import AgenticMedlinePlusRAG
+from Vanilla_RAG import VanillaRAG
 from image_processor import MedicalImageAnalyzer, validate_upload
 
 # ── Crisis / Emergency Guardrails ────────────────────────────────────────────
@@ -350,11 +351,13 @@ section[data-testid="stSidebar"] .stRadio > label {
 if "messages" not in st.session_state:
     st.session_state.messages = []
 if "rag_mode" not in st.session_state:
-    st.session_state.rag_mode = "Non-Agentic RAG"
+    st.session_state.rag_mode = "Query Expansion RAG"
 if "rag_non_agentic" not in st.session_state:
     st.session_state.rag_non_agentic = None
 if "rag_agentic" not in st.session_state:
     st.session_state.rag_agentic = None
+if "rag_vanilla" not in st.session_state:
+    st.session_state.rag_vanilla = None
 if "query_count" not in st.session_state:
     st.session_state.query_count = 0
 if "pending_query" not in st.session_state:
@@ -376,6 +379,10 @@ def get_rag_instance():
         if st.session_state.rag_agentic is None:
             st.session_state.rag_agentic = AgenticMedlinePlusRAG()
         return st.session_state.rag_agentic
+    elif st.session_state.rag_mode == "Vanilla RAG":
+        if st.session_state.rag_vanilla is None:
+            st.session_state.rag_vanilla = VanillaRAG()
+        return st.session_state.rag_vanilla
     else:
         if st.session_state.rag_non_agentic is None:
             st.session_state.rag_non_agentic = MedlinePlusRAG()
@@ -396,10 +403,11 @@ with st.sidebar:
 
     # Mode selector
     st.markdown("##### Retrieval Mode")
+    rag_options = ["Query Expansion RAG", "Agentic RAG", "Vanilla RAG"]
     mode = st.radio(
         "Choose RAG mode",
-        options=["Non-Agentic RAG", "Agentic RAG"],
-        index=0 if st.session_state.rag_mode == "Non-Agentic RAG" else 1,
+        options=rag_options,
+        index=rag_options.index(st.session_state.rag_mode),
         label_visibility="collapsed",
         help="Choose how the system retrieves and processes medical information.",
     )
@@ -428,10 +436,27 @@ with st.sidebar:
             <span class="stat-pill">ReAct reasoning</span>
         </div>
         """, unsafe_allow_html=True)
+    elif st.session_state.rag_mode == "Vanilla RAG":
+        st.markdown("""
+        <div class="info-card">
+            <h4>Vanilla RAG</h4>
+            <p>A simple retrieve-and-generate pipeline. Searches
+            MedlinePlus with the raw query — no query expansion,
+            no topic aliases — then reranks chunks with a
+            cross-encoder before generating a response.</p>
+        </div>
+        """, unsafe_allow_html=True)
+        st.markdown("""
+        <div class="stat-row">
+            <span class="stat-pill">No query expansion</span>
+            <span class="stat-pill">Cross-encoder rerank</span>
+            <span class="stat-pill">Single pass</span>
+        </div>
+        """, unsafe_allow_html=True)
     else:
         st.markdown("""
         <div class="info-card">
-            <h4>Non-Agentic RAG</h4>
+            <h4>Query Expansion RAG</h4>
             <p>A direct retrieval pipeline that scrapes MedlinePlus
             and feeds the relevant content to the LLM.
             Fast and straightforward.</p>
@@ -508,9 +533,10 @@ with st.sidebar:
 
 # Header
 is_agentic = st.session_state.rag_mode == "Agentic RAG"
+is_vanilla = st.session_state.rag_mode == "Vanilla RAG"
 badge_class = "mode-agentic" if is_agentic else "mode-nonagentic"
-badge_label = "Agentic" if is_agentic else "Non-Agentic"
-badge_icon = "🤖" if is_agentic else "📄"
+badge_label = "Agentic" if is_agentic else ("Vanilla" if is_vanilla else "Query Expansion")
+badge_icon = "🤖" if is_agentic else ("🔍" if is_vanilla else "📄")
 
 st.markdown(f"""
 <div class="med-header">

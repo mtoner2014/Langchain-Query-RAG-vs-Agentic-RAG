@@ -8,7 +8,7 @@ A comparative study of two Retrieval-Augmented Generation approaches for healthc
 - **Medical Image Analysis** — upload lab reports, prescription labels, or symptom photos for AI-powered extraction and follow-up MedlinePlus search
 - **Crisis & Emergency Detection** — automatically surfaces hotline numbers when queries mention suicide, self-harm, or medical emergencies
 - **Multi-hop Reasoning** — the agentic mode decomposes complex questions (e.g. drug interactions with comorbidities) into sequential searches
-- **Cross-encoder Reranking** — retrieved chunks are reranked with `cross-encoder/ms-marco-MiniLM-L-6-v2` for higher relevance
+- **FlashRank Reranking** — retrieved chunks are reranked with FlashRank for higher relevance
 - **Debug Panel** — expandable section showing raw content retrieved from MedlinePlus before LLM transformation
 
 ## Architecture
@@ -23,7 +23,7 @@ A comparative study of two Retrieval-Augmented Generation approaches for healthc
 ### Vanilla RAG Pipeline
 
 ```
-User query → MedlinePlus search (raw query) → scrape top results → chunk → Chroma vector store → cross-encoder rerank → GPT-4o-mini → response
+User query → MedlinePlus search (raw query) → scrape top results → chunk → Chroma vector store → FlashRank rerank → GPT-4o-mini → response
 ```
 
 ### Agentic RAG Pipeline
@@ -95,7 +95,8 @@ Interactive prompt — type a health question and get a MedlinePlus-sourced answ
 |---|---|
 | `langchain` / `langchain-openai` | LLM orchestration and LCEL chains |
 | `langchain-chroma` | Ephemeral vector store (both modes) |
-| `langchain-huggingface` | Local embeddings (`all-MiniLM-L6-v2`) and cross-encoder reranking |
+| `langchain-huggingface` | Local embeddings (`all-MiniLM-L6-v2`) |
+| `flashrank` | Fast ONNX-based reranking via `langchain-community` |
 | `streamlit` | Web UI |
 | `beautifulsoup4` / `requests` | MedlinePlus scraping |
 | `python-dotenv` | Environment variable loading |

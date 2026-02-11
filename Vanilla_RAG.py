@@ -22,8 +22,10 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_chroma import Chroma
-from langchain_community.cross_encoders import HuggingFaceCrossEncoder
+from langchain_community.document_compressors import FlashrankRerank
+from flashrank import Ranker
 
+FlashrankRerank.model_rebuild(_types_namespace={"Ranker": Ranker})
 
 load_dotenv()
 
@@ -162,7 +164,7 @@ class VanillaRAG:
     Uses LangChain LCEL retrieval pipeline with:
     - sentence-transformers/all-MiniLM-L6-v2 for embeddings
     - Chroma as the ephemeral vector store
-    - cross-encoder/ms-marco-MiniLM-L-6-v2 for reranking retrieved chunks
+    - FlashRank for reranking retrieved chunks
     """
 
     TOP_K = 4
@@ -179,8 +181,8 @@ class VanillaRAG:
             chunk_overlap=50,
             separators=["\n\n", "\n", ". ", " ", ""],
         )
-        self.cross_encoder = HuggingFaceCrossEncoder(
-            model_name="cross-encoder/ms-marco-MiniLM-L-6-v2",
+        self.reranker = FlashrankRerank(
+            top_n=self.TOP_K,
         )
         self.last_retrieval_debug = []
 
@@ -225,13 +227,10 @@ class VanillaRAG:
         return retriever, tmp_dir
 
     def _rerank(self, query: str, docs: List[Document]) -> List[Document]:
-        """Rerank documents using the cross-encoder model."""
+        """Rerank documents using FlashRank."""
         if len(docs) <= self.TOP_K:
             return docs
-        pairs = [(query, doc.page_content) for doc in docs]
-        scores = self.cross_encoder.score(pairs)
-        scored = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-        return [doc for doc, _ in scored[: self.TOP_K]]
+        return self.reranker.compress_documents(documents=docs, query=query)
 
     @staticmethod
     def _format_chunks(docs: List[Document]) -> tuple[str, List[Dict]]:
